@@ -163,6 +163,7 @@ MIT License - do whatever you want with it, just don't blame me if it breaks.
 ## Credits
 
 Built by [@0xm1r41](https://github.com/0xm1r41). 
+
 Contact info: neonxodyssey@gmail.com
 
 Inspired by the work of people who actually know what they're doing: the Havoc team, the original Cobalt Strike developers, and everyone who's published research on syscalls and PE loading over the years.
